@@ -21,11 +21,11 @@ pub trait Service: ReadOnlyService {
     fn command(
         &mut self,
         command: Self::Command,
-    ) -> impl Future<Output = ServiceEvent<Self>> + Send + 'static;
+    ) -> impl Future<Output = Option<ServiceEvent<Self>>> + Send + 'static;
 }
 ```
 
-`src/services/mod.rs` bridges them to iced with blanket impls: every `ashell_services::ReadOnlyService` is also an ashell `ReadOnlyService` (the stream becomes a `Subscription::run_with` keyed by `TypeId`) and every `ashell_services::Service` is also an ashell `Service` (the future becomes a `Task::perform`). Modules keep using the iced traits described below and don't need to know where a service lives. Migrated services are re-exported from `crate::services` (e.g. `pub use ashell_services::bluetooth;`).
+`src/services/mod.rs` bridges them to iced with blanket impls: every `ashell_services::ReadOnlyService` is also an ashell `ReadOnlyService` (the stream becomes a `Subscription::run_with` keyed by `TypeId`) and every `ashell_services::Service` is also an ashell `Service` (the future becomes a `Task::stream` that yields the event, or nothing when the command returns `None`). Modules keep using the iced traits described below and don't need to know where a service lives. Migrated services are re-exported from `crate::services` (e.g. `pub use ashell_services::bluetooth;`).
 
 Each service sits behind a cargo feature of the same name (`full` enables all of them), so consumers only compile the services, and pull in the system dependencies, they need. The crate has no default features.
 

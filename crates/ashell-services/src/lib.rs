@@ -29,5 +29,5 @@ pub trait Service: ReadOnlyService {
     fn command(
         &mut self,
         command: Self::Command,
-    ) -> impl Future<Output = ServiceEvent<Self>> + Send + 'static;
+    ) -> impl Future<Output = Option<ServiceEvent<Self>>> + Send + 'static;
 }

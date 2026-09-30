@@ -1,4 +1,7 @@
-use iced::{Subscription, Task, futures::StreamExt};
+use iced::{
+    Subscription, Task,
+    futures::{StreamExt, stream},
+};
 use std::any::TypeId;
 
 pub use ashell_services::bluetooth;
@@ -70,9 +73,9 @@ impl<S: ashell_services::Service> Service for S {
     type Command = S::Command;
 
     fn command(&mut self, command: Self::Command) -> Task<ServiceEvent<Self>> {
-        Task::perform(
-            ashell_services::Service::command(self, command),
-            ServiceEvent::from,
+        Task::stream(
+            stream::once(ashell_services::Service::command(self, command))
+                .filter_map(|event| async move { event.map(ServiceEvent::from) }),
         )
     }
 }

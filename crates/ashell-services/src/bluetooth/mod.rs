@@ -273,7 +273,7 @@ impl Service for BluetoothService {
     fn command(
         &mut self,
         command: Self::Command,
-    ) -> impl Future<Output = ServiceEvent<Self>> + Send + 'static {
+    ) -> impl Future<Output = Option<ServiceEvent<Self>>> + Send + 'static {
         let conn = self.conn.clone();
         let mut data = self.data.clone();
 
@@ -281,7 +281,7 @@ impl Service for BluetoothService {
             match command {
                 BluetoothCommand::Toggle => {
                     if data.state == BluetoothState::Unavailable {
-                        return ServiceEvent::Update(data);
+                        return None;
                     }
 
                     let powered = data.state == BluetoothState::Active;
@@ -296,7 +296,7 @@ impl Service for BluetoothService {
                         }
                     }
 
-                    ServiceEvent::Update(data)
+                    Some(ServiceEvent::Update(data))
                 }
                 BluetoothCommand::StartDiscovery => {
                     if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
@@ -306,35 +306,35 @@ impl Service for BluetoothService {
                         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
                         let _ = bluetooth.stop_discovery().await;
                     }
-                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                    Some(ServiceEvent::Update(BluetoothService::refresh(&conn).await))
                 }
                 BluetoothCommand::PairDevice(device_path) => {
                     if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
                         debug!("Pairing device: {:?}", device_path);
                         let _ = bluetooth.pair_device(&device_path).await;
                     }
-                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                    Some(ServiceEvent::Update(BluetoothService::refresh(&conn).await))
                 }
                 BluetoothCommand::ConnectDevice(device_path) => {
                     if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
                         debug!("Connecting device: {:?}", device_path);
                         let _ = bluetooth.connect_device(&device_path).await;
                     }
-                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                    Some(ServiceEvent::Update(BluetoothService::refresh(&conn).await))
                 }
                 BluetoothCommand::DisconnectDevice(device_path) => {
                     if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
                         debug!("Disconnecting device: {:?}", device_path);
                         let _ = bluetooth.disconnect_device(&device_path).await;
                     }
-                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                    Some(ServiceEvent::Update(BluetoothService::refresh(&conn).await))
                 }
                 BluetoothCommand::RemoveDevice(device_path) => {
                     if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
                         debug!("Removing device: {:?}", device_path);
                         let _ = bluetooth.remove_device(&device_path).await;
                     }
-                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                    Some(ServiceEvent::Update(BluetoothService::refresh(&conn).await))
                 }
             }
         }
