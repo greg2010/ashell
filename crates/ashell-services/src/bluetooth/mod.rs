@@ -1,13 +1,14 @@
-use super::{ReadOnlyService, Service, ServiceEvent};
+use crate::{ReadOnlyService, Service, ServiceEvent, stream::channel};
 use dbus::{BatteryProxy, BluetoothDbus, DeviceProxy};
-use iced::{
-    Subscription, Task,
-    futures::{SinkExt, Stream, StreamExt, channel::mpsc::Sender, stream::pending, stream_select},
-    stream::channel,
+use futures::{
+    SinkExt, Stream, StreamExt,
+    channel::mpsc::Sender,
+    stream::{pending, select_all},
+    stream_select,
 };
 use inotify::{Inotify, WatchMask};
 use log::{debug, error, info, warn};
-use std::{any::TypeId, io::ErrorKind, ops::Deref, pin::Pin};
+use std::{io::ErrorKind, ops::Deref, pin::Pin};
 use tokio::process::Command;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -144,15 +145,15 @@ impl BluetoothService {
                 }
 
                 let battery_events = if batteries.is_empty() {
-                    iced::futures::stream::pending().boxed()
+                    pending().boxed()
                 } else {
-                    iced::futures::stream::select_all(batteries).boxed()
+                    select_all(batteries).boxed()
                 };
 
                 let device_property_events = if device_properties.is_empty() {
-                    iced::futures::stream::pending().boxed()
+                    pending().boxed()
                 } else {
-                    iced::futures::stream::select_all(device_properties).boxed()
+                    select_all(device_properties).boxed()
                 };
 
                 Box::pin(stream_select!(
@@ -230,20 +231,12 @@ impl BluetoothService {
         }
     }
 
-    async fn spawn_rfkill(binary: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
-        let mut command = Command::new(binary);
-        for arg in args {
-            command.arg(arg);
-        }
-        command.output().await
-    }
-
-    async fn run_rfkill_command(args: &[&str]) -> std::io::Result<std::process::Output> {
-        BluetoothService::spawn_rfkill("rfkill", args).await
-    }
-
     pub async fn check_rfkill_soft_block() -> anyhow::Result<bool> {
-        let output = match BluetoothService::run_rfkill_command(&["list", "bluetooth"]).await {
+        let output = match Command::new("rfkill")
+            .args(["list", "bluetooth"])
+            .output()
+            .await
+        {
             Ok(output) => output,
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 warn!("rfkill binary not found, assuming bluetooth is not soft blocked");
@@ -273,6 +266,16 @@ impl BluetoothService {
         }
     }
 
+    async fn refresh(conn: &zbus::Connection) -> BluetoothData {
+        BluetoothService::initialize_data(conn)
+            .await
+            .unwrap_or_else(|_| BluetoothData {
+                state: BluetoothState::Unavailable,
+                devices: vec![],
+                discovering: false,
+            })
+    }
+
     async fn toggle_power(conn: &zbus::Connection, power: bool) -> anyhow::Result<()> {
         let bluetooth = BluetoothDbus::new(conn).await?;
 
@@ -290,15 +293,13 @@ impl ReadOnlyService for BluetoothService {
         self.data = event;
     }
 
-    fn subscribe() -> Subscription<ServiceEvent<Self>> {
-        Subscription::run_with(TypeId::of::<Self>(), |_| {
-            channel(100, async |mut output| {
-                let mut state = State::Init;
+    fn subscribe() -> impl Stream<Item = ServiceEvent<Self>> + Send + 'static {
+        channel(100, |mut output| async move {
+            let mut state = State::Init;
 
-                loop {
-                    state = BluetoothService::start_listening(state, &mut output).await;
-                }
-            })
+            loop {
+                state = BluetoothService::start_listening(state, &mut output).await;
+            }
         })
     }
 }
@@ -306,138 +307,72 @@ impl ReadOnlyService for BluetoothService {
 impl Service for BluetoothService {
     type Command = BluetoothCommand;
 
-    fn command(&mut self, command: Self::Command) -> Task<ServiceEvent<Self>> {
-        match command {
-            BluetoothCommand::Toggle => {
-                let conn = self.conn.clone();
+    fn command(
+        &mut self,
+        command: Self::Command,
+    ) -> impl Future<Output = ServiceEvent<Self>> + Send + 'static {
+        let conn = self.conn.clone();
+        let mut data = self.data.clone();
 
-                if self.data.state == BluetoothState::Unavailable {
-                    Task::none()
-                } else {
-                    let mut data = self.data.clone();
+        async move {
+            match command {
+                BluetoothCommand::Toggle => {
+                    if data.state == BluetoothState::Unavailable {
+                        return ServiceEvent::Update(data);
+                    }
 
-                    Task::perform(
-                        async move {
-                            let powered = data.state == BluetoothState::Active;
-                            debug!("Toggling bluetooth power to: {}", !powered);
-                            let res = BluetoothService::toggle_power(&conn, !powered).await;
+                    let powered = data.state == BluetoothState::Active;
+                    debug!("Toggling bluetooth power to: {}", !powered);
+                    let res = BluetoothService::toggle_power(&conn, !powered).await;
 
-                            if res.is_ok() {
-                                data.state = if powered {
-                                    BluetoothState::Inactive
-                                } else {
-                                    BluetoothState::Active
-                                }
-                            }
+                    if res.is_ok() {
+                        data.state = if powered {
+                            BluetoothState::Inactive
+                        } else {
+                            BluetoothState::Active
+                        }
+                    }
 
-                            data
-                        },
-                        ServiceEvent::Update,
-                    )
+                    ServiceEvent::Update(data)
                 }
-            }
-            BluetoothCommand::StartDiscovery => {
-                let conn = self.conn.clone();
-                Task::perform(
-                    async move {
-                        let bluetooth = BluetoothDbus::new(&conn).await;
-                        if let Ok(bluetooth) = bluetooth {
-                            let _ = bluetooth.start_discovery().await;
+                BluetoothCommand::StartDiscovery => {
+                    if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
+                        let _ = bluetooth.start_discovery().await;
 
-                            // Auto-stop after 15 seconds
-                            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                            let _ = bluetooth.stop_discovery().await;
-                        }
-                        BluetoothService::initialize_data(&conn)
-                            .await
-                            .unwrap_or_else(|_| BluetoothData {
-                                state: BluetoothState::Unavailable,
-                                devices: vec![],
-                                discovering: false,
-                            })
-                    },
-                    ServiceEvent::Update,
-                )
-            }
-            BluetoothCommand::PairDevice(device_path) => {
-                let conn = self.conn.clone();
-                Task::perform(
-                    async move {
-                        let bluetooth = BluetoothDbus::new(&conn).await;
-                        if let Ok(bluetooth) = bluetooth {
-                            debug!("Pairing device: {:?}", device_path);
-                            let _ = bluetooth.pair_device(&device_path).await;
-                        }
-                        BluetoothService::initialize_data(&conn)
-                            .await
-                            .unwrap_or_else(|_| BluetoothData {
-                                state: BluetoothState::Unavailable,
-                                devices: vec![],
-                                discovering: false,
-                            })
-                    },
-                    ServiceEvent::Update,
-                )
-            }
-            BluetoothCommand::ConnectDevice(device_path) => {
-                let conn = self.conn.clone();
-                Task::perform(
-                    async move {
-                        let bluetooth = BluetoothDbus::new(&conn).await;
-                        if let Ok(bluetooth) = bluetooth {
-                            debug!("Connecting device: {:?}", device_path);
-                            let _ = bluetooth.connect_device(&device_path).await;
-                        }
-                        BluetoothService::initialize_data(&conn)
-                            .await
-                            .unwrap_or_else(|_| BluetoothData {
-                                state: BluetoothState::Unavailable,
-                                devices: vec![],
-                                discovering: false,
-                            })
-                    },
-                    ServiceEvent::Update,
-                )
-            }
-            BluetoothCommand::DisconnectDevice(device_path) => {
-                let conn = self.conn.clone();
-                Task::perform(
-                    async move {
-                        let bluetooth = BluetoothDbus::new(&conn).await;
-                        if let Ok(bluetooth) = bluetooth {
-                            debug!("Disconnecting device: {:?}", device_path);
-                            let _ = bluetooth.disconnect_device(&device_path).await;
-                        }
-                        BluetoothService::initialize_data(&conn)
-                            .await
-                            .unwrap_or_else(|_| BluetoothData {
-                                state: BluetoothState::Unavailable,
-                                devices: vec![],
-                                discovering: false,
-                            })
-                    },
-                    ServiceEvent::Update,
-                )
-            }
-            BluetoothCommand::RemoveDevice(device_path) => {
-                let conn = self.conn.clone();
-                Task::perform(
-                    async move {
-                        let bluetooth = BluetoothDbus::new(&conn).await;
-                        if let Ok(bluetooth) = bluetooth {
-                            debug!("Removing device: {:?}", device_path);
-                            let _ = bluetooth.remove_device(&device_path).await;
-                        }
-                        BluetoothService::initialize_data(&conn)
-                            .await
-                            .unwrap_or_else(|_| BluetoothData {
-                                state: BluetoothState::Unavailable,
-                                devices: vec![],
-                                discovering: false,
-                            })
-                    },
-                    ServiceEvent::Update,
-                )
+                        // Auto-stop after 15 seconds
+                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                        let _ = bluetooth.stop_discovery().await;
+                    }
+                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                }
+                BluetoothCommand::PairDevice(device_path) => {
+                    if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
+                        debug!("Pairing device: {:?}", device_path);
+                        let _ = bluetooth.pair_device(&device_path).await;
+                    }
+                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                }
+                BluetoothCommand::ConnectDevice(device_path) => {
+                    if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
+                        debug!("Connecting device: {:?}", device_path);
+                        let _ = bluetooth.connect_device(&device_path).await;
+                    }
+                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                }
+                BluetoothCommand::DisconnectDevice(device_path) => {
+                    if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
+                        debug!("Disconnecting device: {:?}", device_path);
+                        let _ = bluetooth.disconnect_device(&device_path).await;
+                    }
+                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                }
+                BluetoothCommand::RemoveDevice(device_path) => {
+                    if let Ok(bluetooth) = BluetoothDbus::new(&conn).await {
+                        debug!("Removing device: {:?}", device_path);
+                        let _ = bluetooth.remove_device(&device_path).await;
+                    }
+                    ServiceEvent::Update(BluetoothService::refresh(&conn).await)
+                }
             }
         }
     }
