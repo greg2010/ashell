@@ -10,16 +10,9 @@ repository.workspace = true
 publish = false
 
 [features]
-full = ["bluetooth"]
-bluetooth = [
-  "dep:anyhow",
-  "dep:inotify",
-  "dep:log",
-  "dep:tokio",
-  "dep:zbus",
-  "tokio/process",
-  "tokio/time",
-]
+full = ["bluetooth", "rfkill"]
+bluetooth = ["rfkill", "dep:anyhow", "dep:log", "dep:tokio", "dep:zbus", "tokio/time"]
+rfkill = ["dep:anyhow", "dep:inotify", "dep:log", "dep:tokio", "tokio/process"]
 
 [dependencies]
 futures = "0.3"

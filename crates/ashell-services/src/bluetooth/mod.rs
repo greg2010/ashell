@@ -1,4 +1,4 @@
-use crate::{ReadOnlyService, Service, ServiceEvent, stream::channel};
+use crate::{ReadOnlyService, Service, ServiceEvent, rfkill, stream::channel};
 use dbus::{BatteryProxy, BluetoothDbus, DeviceProxy};
 use futures::{
     SinkExt, Stream, StreamExt,
@@ -6,10 +6,8 @@ use futures::{
     stream::{pending, select_all},
     stream_select,
 };
-use inotify::{Inotify, WatchMask};
-use log::{debug, error, info, warn};
-use std::{io::ErrorKind, ops::Deref, pin::Pin};
-use tokio::process::Command;
+use log::{debug, error, info};
+use std::{ops::Deref, pin::Pin};
 use zbus::zvariant::OwnedObjectPath;
 
 mod dbus;
@@ -74,7 +72,7 @@ impl BluetoothService {
         let bluetooth = BluetoothDbus::new(conn).await?;
 
         let state = bluetooth.state().await?;
-        let rfkill_soft_block = BluetoothService::check_rfkill_soft_block().await?;
+        let rfkill_soft_block = rfkill::bluetooth_soft_blocked().await?;
 
         let state = match state {
             BluetoothState::Unavailable => BluetoothState::Unavailable,
@@ -112,7 +110,7 @@ impl BluetoothService {
             Some(adapter) => {
                 let powered = adapter.receive_powered_changed().await.map(|_| {});
                 let discovering = adapter.receive_discovering_changed().await.map(|_| {});
-                let rfkill = BluetoothService::listen_rfkill_soft_block_changes().await?;
+                let rfkill = rfkill::soft_block_changes().await?;
                 let devices = bluetooth.devices().await?;
 
                 let mut batteries: Vec<EventStream> = Vec::with_capacity(devices.len());
@@ -228,41 +226,6 @@ impl BluetoothService {
                 let _ = pending::<u8>().next().await;
                 State::Error
             }
-        }
-    }
-
-    pub async fn check_rfkill_soft_block() -> anyhow::Result<bool> {
-        let output = match Command::new("rfkill")
-            .args(["list", "bluetooth"])
-            .output()
-            .await
-        {
-            Ok(output) => output,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                warn!("rfkill binary not found, assuming bluetooth is not soft blocked");
-                return Ok(false);
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        let output = String::from_utf8(output.stdout)?;
-
-        Ok(output.contains("Soft blocked: yes"))
-    }
-
-    pub async fn listen_rfkill_soft_block_changes() -> anyhow::Result<EventStream> {
-        let inotify = Inotify::init()?;
-
-        match inotify.watches().add("/dev/rfkill", WatchMask::MODIFY) {
-            Ok(_) => {
-                let buffer = [0; 512];
-                Ok(inotify.into_event_stream(buffer)?.map(|_| {}).boxed())
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                warn!("/dev/rfkill not found, disabling rfkill change notifications for bluetooth");
-                Ok(pending().boxed())
-            }
-            Err(err) => Err(err.into()),
         }
     }
 
