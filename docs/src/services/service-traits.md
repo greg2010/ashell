@@ -2,6 +2,35 @@
 
 The service abstraction is defined in `src/services/mod.rs`. It provides a standard interface for all backend services.
 
+## UI-agnostic services (`ashell-services`)
+
+Services are being moved to the `ashell-services` workspace crate (`crates/ashell-services/`), which does not depend on iced. There the traits speak plain `futures` types:
+
+```rust
+pub trait ReadOnlyService: Sized + Clone + Send + 'static {
+    type UpdateEvent: Send + 'static;
+    type Error: Clone + Send + 'static;
+
+    fn update(&mut self, event: Self::UpdateEvent);
+    fn subscribe() -> impl Stream<Item = ServiceEvent<Self>> + Send + 'static;
+}
+
+pub trait Service: ReadOnlyService {
+    type Command: Send + 'static;
+
+    fn command(
+        &mut self,
+        command: Self::Command,
+    ) -> impl Future<Output = ServiceEvent<Self>> + Send + 'static;
+}
+```
+
+`src/services/mod.rs` bridges them to iced with blanket impls: every `ashell_services::ReadOnlyService` is also an ashell `ReadOnlyService` (the stream becomes a `Subscription::run_with` keyed by `TypeId`) and every `ashell_services::Service` is also an ashell `Service` (the future becomes a `Task::perform`). Modules keep using the iced traits described below and don't need to know where a service lives. Migrated services are re-exported from `crate::services` (e.g. `pub use ashell_services::bluetooth;`).
+
+Each service sits behind a cargo feature of the same name (`full` enables all of them), so consumers only compile the services, and pull in the system dependencies, they need. The crate has no default features.
+
+Currently migrated: Bluetooth (`bluetooth` feature). Shared helpers that are not services live in plain modules, e.g. `rfkill` (soft-block state and change notifications, used by both bluetooth and network).
+
 ## ServiceEvent
 
 All services communicate through a common event enum:
@@ -42,7 +71,7 @@ For services that accept commands (bidirectional):
 
 ```rust
 pub trait Service: ReadOnlyService {
-    type Command;
+    type Command: Send + 'static;
 
     fn command(&mut self, command: Self::Command) -> Task<ServiceEvent<Self>>;
 }
